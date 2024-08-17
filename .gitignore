@@ -1,0 +1,5 @@
+wandb
+checkpoint
+*.pth
+test*
+__pycache__
