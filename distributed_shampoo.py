@@ -8,6 +8,23 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
+import math
+import numpy as np
+import torch
+import torch.distributed as dist
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+import math
+import numpy as np
+import torch
+import torch.distributed as dist
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
 class ZeroShampooWithAdamGraftingOptimizer:
     def __init__(
         self,
@@ -23,56 +40,139 @@ class ZeroShampooWithAdamGraftingOptimizer:
         weight_decay=0.001,
         device=None,
         dtype=None,
+        block_size=128,
     ):
-        self.params = list(params)
-        self.lr = lr
-        self.shampoo_beta1, self.shampoo_beta2 = betas
-        self.shampoo_eps = shampoo_eps
-        self.adam_beta1, self.adam_beta2 = adam_betas
-        self.adam_eps = adam_eps
-        self.precondition_frequency = precondition_frequency or start_preconditioning
-        self.start_preconditioning = start_preconditioning
-        self.independent_weight_decay = independent_weight_decay
-        self.weight_decay = weight_decay
+        if isinstance(params, (list, tuple)) and isinstance(params[0], dict):
+            self.param_groups = params
+        else:
+            self.param_groups = [{"params": list(params)}]
+
+        self.defaults = dict(
+            lr=lr,
+            betas=betas,
+            shampoo_eps=shampoo_eps,
+            adam_betas=adam_betas,
+            adam_eps=adam_eps,
+            precondition_frequency=precondition_frequency or start_preconditioning,
+            start_preconditioning=start_preconditioning,
+            independent_weight_decay=independent_weight_decay,
+            weight_decay=weight_decay,
+        )
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         self.dtype = dtype or torch.float32
-
         self.state = {}
-        # Distributed training setup
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
+        self.block_size = block_size
 
+        # Distributed training setup
+        try:
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+            self.is_distributed = True
+        except Exception as e:
+            print(
+                "Distributed training not initialized, setting rank and world size to 0"
+            )
+            self.rank = 0
+            self.world_size = 1
+            self.is_distributed = False
+
+        self.param_stats = {}
+        self._make_lookup_and_enumeratables()
         self._init_state()
 
+    @torch.no_grad()
+    def _make_lookup_and_enumeratables(self):
+        self.lookup = {}
+        self.enumeratables = []
+        global_counter = 0
+        total_params = 0
+
+        for group in self.param_groups:
+            for param in group["params"]:
+                if param.requires_grad:
+                    name = f"param"
+                    s1, s2 = self._get_left_right_shape(param)
+                    for i1 in range(0, s1, self.block_size):
+                        i1r = min(i1 + self.block_size, s1)
+                        for i2 in range(0, s2, self.block_size):
+                            i2r = min(i2 + self.block_size, s2)
+                            block_name = (
+                                f"{name}_{global_counter}_{i1}_{i1r}_{i2}_{i2r}"
+                            )
+                            self.enumeratables.append(
+                                (
+                                    global_counter,
+                                    block_name,
+                                    param,
+                                    (s1, s2),
+                                    (i1, i1r),
+                                    (i2, i2r),
+                                    group,
+                                )
+                            )
+                            total_params += (i1r - i1) * (i2r - i2)
+                            if param not in self.param_stats:
+                                self.param_stats[param] = []
+
+                            self.param_stats[param].append(
+                                (i1, i1r, i2, i2r, s1, s2, block_name)
+                            )
+
+                    global_counter += 1
+
+            # make default
+            for k, v in self.defaults.items():
+                group[k] = v
+
+        total_param_in_model = 0
+        for group in self.param_groups:
+            for param in group["params"]:
+                total_param_in_model += param.numel()
+
+        assert (
+            total_params == total_param_in_model
+        ), f"Total params: {total_params} != {total_param_in_model}"
+
+    def _enumerate_sharded_params(self):
+        for global_counter, block_name, param, (s1, s2), (i1, i1r), (
+            i2,
+            i2r,
+        ), group in self.enumeratables:
+            if global_counter % self.world_size != self.rank:
+                continue
+            yield block_name, param, (s1, s2), (i1, i1r), (i2, i2r), group
+
     def _init_state(self):
-        for i, param in enumerate(self.params):
-            if i % self.world_size != self.rank:
-                continue  # Skip parameters not managed by this rank
-            print(f"Rank {self.rank} is managing parameter {i}, shape: {param.shape}")
-            state = self.state[param] = {}
+        for block_name, param, (s1, s2), (i1, i1r), (
+            i2,
+            i2r,
+        ), group in self._enumerate_sharded_params():
+            block_param = param.view(s1, s2)[i1:i1r, i2:i2r]
+            print(
+                f"Rank {self.rank} is managing parameter {block_name}, shape: {block_param.shape}, dtype: {block_param.dtype}, range {i1}:{i1r}, {i2}:{i2r}"
+            )
+            assert (
+                self.state.get(block_name, None) is None
+            ), f"State for {block_name} already exists"
+            self.state[block_name] = {}
+            state = self.state[block_name]
             state["step"] = 0
             state["m_adam"] = torch.zeros_like(
-                param, device=self.device, dtype=self.dtype
+                block_param, device=self.device, dtype=self.dtype
             )
             state["v_adam"] = torch.zeros_like(
-                param, device=self.device, dtype=self.dtype
+                block_param, device=self.device, dtype=self.dtype
             )
-
-            left_shape, right_shape = self._get_left_right_shape(param)
-            state["left_preconditioner_accum"] = self.shampoo_eps * torch.eye(
-                left_shape, device=self.device, dtype=self.dtype
+            state["left_preconditioner_accum"] = group["shampoo_eps"] * torch.eye(
+                i1r - i1, device=self.device, dtype=self.dtype
             )
-            state["right_preconditioner_accum"] = self.shampoo_eps * torch.eye(
-                right_shape, device=self.device, dtype=self.dtype
+            state["right_preconditioner_accum"] = group["shampoo_eps"] * torch.eye(
+                i2r - i2, device=self.device, dtype=self.dtype
             )
-            state["left_preconditioner"] = torch.eye(
-                left_shape, device=self.device, dtype=self.dtype
-            )
-            state["right_preconditioner"] = torch.eye(
-                right_shape, device=self.device, dtype=self.dtype
-            )
+            state["left_preconditioner"] = None
+            state["right_preconditioner"] = None
 
     def _get_left_right_shape(self, param):
         if param.ndim == 1:
@@ -81,75 +181,94 @@ class ZeroShampooWithAdamGraftingOptimizer:
             return (np.prod(param.shape[:-1]), param.shape[-1])
 
     def zero_grad(self):
-        for param in self.params:
-            if param.grad is not None:
-                param.grad.detach_()
-                param.grad.zero_()
+        for group in self.param_groups:
+            for param in group["params"]:
+                if param.grad is not None:
+                    param.grad.detach_()
+                    param.grad.zero_()
 
     @torch.no_grad()
     def step(self):
-        for i, param in enumerate(self.params):
-            if param.grad is None:
-                continue
+        self._reduce_gradients()
 
-            if i % self.world_size != self.rank:
-                continue  # Skip parameters not managed by this rank
-
+        for block_name, param, (s1, s2), (i1, i1r), (
+            i2,
+            i2r,
+        ), group in self._enumerate_sharded_params():
             grad = param.grad
-            state = self.state[param]
+            assert grad is not None, f"Gradient is None for {block_name}"
+            state = self.state[block_name]
+
+            block_param = param.view(s1, s2)[i1:i1r, i2:i2r]
+            block_grad = grad.view(s1, s2)[i1:i1r, i2:i2r]
+            # print(block_grad.shape, block_param.shape, block_name, i1, i1r, i2, i2r)
+
+            assert block_param.shape == block_grad.shape, (
+                block_param.shape,
+                block_grad.shape,
+            )
+
+            left_shape, right_shape = block_param.shape
 
             # Update step count
             state["step"] += 1
 
+            # Get group-specific hyperparameters
+            lr = group["lr"]
+
+            weight_decay = group["weight_decay"]
+            independent_weight_decay = group["independent_weight_decay"]
+            shampoo_beta1, shampoo_beta2 = group["betas"]
+            adam_beta1, adam_beta2 = group["adam_betas"]
+            adam_eps = group["adam_eps"]
+            start_preconditioning = group["start_preconditioning"]
+            precondition_frequency = group["precondition_frequency"]
+
+            # print(f"Rank {self.rank} is using learning rate {lr}, step {state['step']}")
+
             # Perform stepweight decay
-            if self.independent_weight_decay:
-                param.data.mul_(1 - self.lr * self.weight_decay)
+            if independent_weight_decay:
+                block_param.data.mul_(1 - lr * weight_decay)
 
-            # If doing "add to input" weight decay, do it here
-            if not self.independent_weight_decay:
-                grad = grad.add(param, alpha=self.weight_decay)
-
-            # Get shapes for preconditioners
-            grad_shape = grad.shape
-            left_shape, right_shape = self._get_left_right_shape(param)
-            grad_rs = grad.view(left_shape, right_shape)
-
+            block_grad_shape = block_grad.shape
+            # print(block_grad)
             # Update preconditioners
-            state["left_preconditioner_accum"].mul_(self.shampoo_beta1).add_(
-                grad_rs @ grad_rs.t(), alpha=1 - self.shampoo_beta1
+            state["left_preconditioner_accum"].mul_(shampoo_beta1).add_(
+                block_grad @ block_grad.t(), alpha=1 - shampoo_beta1
             )
-            state["right_preconditioner_accum"].mul_(self.shampoo_beta1).add_(
-                grad_rs.t() @ grad_rs, alpha=1 - self.shampoo_beta1
+            state["right_preconditioner_accum"].mul_(shampoo_beta1).add_(
+                block_grad.t() @ block_grad, alpha=1 - shampoo_beta1
             )
 
             # Update Adam state
-            state["m_adam"].mul_(self.adam_beta1).add_(grad, alpha=1 - self.adam_beta1)
-            state["v_adam"].mul_(self.adam_beta2).addcmul_(
-                grad, grad, value=1 - self.adam_beta2
+            state["m_adam"].mul_(adam_beta1).add_(block_grad, alpha=1 - adam_beta1)
+            state["v_adam"].mul_(adam_beta2).addcmul_(
+                block_grad, block_grad, value=1 - adam_beta2
             )
 
-            m_hat = state["m_adam"] / (1 - self.adam_beta1 ** state["step"])
-            v_hat = state["v_adam"] / (1 - self.adam_beta2 ** state["step"])
+            m_hat = state["m_adam"] / (1 - adam_beta1 ** state["step"])
+            v_hat = state["v_adam"] / (1 - adam_beta2 ** state["step"])
+            adam_update_dir = m_hat / (torch.sqrt(v_hat) + adam_eps)
 
-            if state["step"] >= self.start_preconditioning:
-                if state["step"] % self.precondition_frequency == 0:
-                    state["left_preconditioner"] = (
-                        self._matrix_pth_power_via_eigendecompsition(
-                            state["left_preconditioner_accum"], p=-1 / 4
-                        )
+            if state["step"] >= start_preconditioning:
+                if state["step"] % precondition_frequency == 0:
+                    state[
+                        "left_preconditioner"
+                    ] = self._matrix_pth_power_via_eigendecompsition(
+                        state["left_preconditioner_accum"], p=-1 / 4
                     )
-                    state["right_preconditioner"] = (
-                        self._matrix_pth_power_via_eigendecompsition(
-                            state["right_preconditioner_accum"], p=-1 / 4
-                        )
+                    state[
+                        "right_preconditioner"
+                    ] = self._matrix_pth_power_via_eigendecompsition(
+                        state["right_preconditioner_accum"], p=-1 / 4
                     )
 
-                adam_update_dir = m_hat / (torch.sqrt(v_hat) + self.adam_eps)
                 fnorm_of_adam_update_dir = torch.linalg.norm(adam_update_dir)
+                grad_momentum = state["m_adam"]
 
                 shampoo_update_dir = (
                     state["left_preconditioner"]
-                    @ grad_rs
+                    @ grad_momentum
                     @ state["right_preconditioner"]
                 )
 
@@ -161,16 +280,86 @@ class ZeroShampooWithAdamGraftingOptimizer:
                     / fnorm_of_shampoo_update_dir
                 )
             else:
-                update_dir = m_hat / (torch.sqrt(v_hat) + self.adam_eps)
-                update_dir = update_dir.view((left_shape, right_shape))
+                update_dir = adam_update_dir
 
-            param.data.add_(update_dir.view(grad_shape), alpha=-self.lr)
+            assert update_dir.shape == block_param.shape
+            assert update_dir.shape == block_grad.shape
 
-        # Synchronize updated parameters across GPUs
+            param.view(s1, s2)[i1:i1r, i2:i2r].data.add_(update_dir, alpha=-lr)
+
         self._sync_params()
 
+    def _check_momentum_and_variance(self):
+        num_total_params = 0
+        # iterate over all params
+        for group in self.param_groups:
+            for param in group["params"]:
+                num_total_params += param.numel()
+
+        num_non_zero_params = 0
+        for block_name, param, (s1, s2), (i1, i1r), (
+            i2,
+            i2r,
+        ), group in self._enumerate_sharded_params():
+            state = self.state[block_name]
+            # check if the values are very-close to non-zero or not
+            assert not torch.allclose(
+                state["m_adam"], torch.zeros_like(state["m_adam"]), atol=1e-8
+            ), f"Momentum is zero for {block_name}: average var: {state['m_adam'].abs().mean()}, state: {state['m_adam']}"
+            assert not torch.allclose(
+                state["v_adam"], torch.zeros_like(state["v_adam"]), atol=1e-8
+            ), f"Variance is zero for {block_name}: average var: {state['v_adam'].abs().mean()}, state: {state['v_adam']}"
+            num_non_zero_params += (i1r - i1) * (i2r - i2)
+
+        assert (
+            num_non_zero_params == num_total_params
+        ), f"Num non-zero params: {num_non_zero_params} != {num_total_params}"
+        print("All momentum and variance are non-zero")
+
+    def build_global_state_for_debug_purposes(self):
+        self.global_state = {}
+        for global_counter, block_name, param, (s1, s2), (i1, i1r), (
+            i2,
+            i2r,
+        ), group in self.enumeratables:
+            if global_counter % self.world_size != self.rank:
+                continue
+
+            if param not in self.global_state:
+                self.global_state[param] = {}
+            # make exp_avg, exp_avg_sq
+            if "exp_avg" not in self.global_state[param]:
+                self.global_state[param]["exp_avg"] = torch.ones_like(param.data).view(
+                    s1, s2
+                )
+            if "exp_avg_sq" not in self.global_state[param]:
+                self.global_state[param]["exp_avg_sq"] = torch.ones_like(
+                    param.data
+                ).view(s1, s2)
+
+            print(f"Doing {block_name}, {i1}:{i1r}, {i2}:{i2r}")
+            assert self.state[block_name]["m_adam"].shape == (i1r - i1, i2r - i2)
+            # fill in
+            self.global_state[param]["exp_avg"][i1:i1r, i2:i2r] = self.state[
+                block_name
+            ]["m_adam"]
+            self.global_state[param]["exp_avg_sq"][i1:i1r, i2:i2r] = self.state[
+                block_name
+            ]["v_adam"]
+
+    @torch.no_grad()
     def _matrix_pth_power_via_eigendecompsition(self, mat, p=-1 / 4):
-        eigvals, eigvecs = torch.linalg.eigh(mat)
+        try:
+            eigvals, eigvecs = torch.linalg.eigh(mat)
+        except Exception as e:
+            print("RuntimeError in _matrix_pth_power_via_eigendecompsition")
+            print("mat", mat)
+            print("p", p)
+            print("trace", mat.trace().item())
+            print("rank", self.rank)
+
+            raise
+
         mineig = min(eigvals.min().item(), 0)
 
         eigvals = eigvals - mineig + 1e-8
@@ -178,20 +367,33 @@ class ZeroShampooWithAdamGraftingOptimizer:
 
         return eigvecs @ torch.diag(eigvals) @ eigvecs.t()
 
+    @torch.no_grad()
     def _sync_params(self):
-        for i, param in enumerate(self.params):
-            if i % self.world_size == self.rank:
-                # Broadcast parameters from the responsible rank to all others
+        if not self.is_distributed:
+            return
+        did_broadcast_list = set()
+        for global_counter, block_name, param, (s1, s2), (i1, i1r), (
+            i2,
+            i2r,
+        ), group in self.enumeratables:
+            if global_counter in did_broadcast_list:
+                continue
+
+            if global_counter % self.world_size == self.rank:
                 dist.broadcast(param.data, src=self.rank)
             else:
-                # Receive parameters from the responsible rank
-                dist.broadcast(param.data, src=i % self.world_size)
+                dist.broadcast(param.data, src=global_counter % self.world_size)
 
-    def reduce_gradients(self):
-        for param in self.params:
-            if param.grad is not None:
-                dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
-                param.grad.data /= self.world_size
+            did_broadcast_list.add(global_counter)
+
+    @torch.no_grad()
+    def _reduce_gradients(self):
+        if not self.is_distributed:
+            return
+        for group in self.param_groups:
+            for param in group["params"]:
+                if param.grad is not None:
+                    dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
 
 
 import os
@@ -296,126 +498,3 @@ def test(model, device, test_loader):
         wandb.log({"test_loss": test_loss, "accuracy": accuracy})
 
     return accuracy, test_loss
-
-
-from pathlib import Path
-
-from torch.profiler import ProfilerActivity, profile, record_function
-
-
-@click.command()
-@click.option("--width", default=128, help="Width of the hidden layers")
-@click.option("--lr", default=1e-3, help="Learning rate")
-@click.option("--epochs", default=4, help="Number of epochs")
-@click.option("--shampoo", is_flag=True, help="Use Shampoo optimizer")
-@click.option("--do_profile", is_flag=True, help="Profile the training")
-def main(width=128, lr=1e-3, epochs=2, shampoo=True, do_profile=False):
-    # Initialize distributed environment
-    dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    torch.manual_seed(42 + rank)
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-
-    # Set hyperparameters
-    per_device_batch_size = 64
-    test_batch_size = 1000
-
-    # (1024 x 4096) @ (4096 x 4096)
-
-    if rank == 0:
-        wandb.init(
-            project="zero-shampoo",
-            entity="simo",
-            name=f"mnist_zero_shampoo_{width}_{lr}_{epochs}_{per_device_batch_size}_{test_batch_size}",
-            config={
-                "width": width,
-                "lr": lr,
-                "epochs": epochs,
-                "batch_size": per_device_batch_size * world_size,
-                "test_batch_size": test_batch_size,
-                "shampoo": shampoo,
-                "world_size": world_size,
-            },
-            tags=["zero_shampoo"],
-        )
-
-    # Load MNIST dataset
-    transform = transforms.Compose(
-        [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
-    )
-
-    train_dataset = datasets.MNIST(
-        "../data", train=True, download=True, transform=transform
-    )
-    test_dataset = datasets.MNIST("../data", train=False, transform=transform)
-
-    train_sampler = DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=rank
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=per_device_batch_size,
-        sampler=train_sampler,
-        num_workers=8,
-    )
-    test_loader = DataLoader(test_dataset, batch_size=test_batch_size, shuffle=False)
-
-    # Initialize the model and optimizer
-    model = Net(width).to(device)
-
-    num_params = sum(p.numel() for p in model.parameters())  # 187M
-    flop_for_fwd_bwd = 6 * num_params * len(train_dataset) * TOKEN_LENGTH
-    theoretical_flops = world_size * 500 * 10**12  # 500 TFLOPS per device
-
-    # model = nn.parallel.DistributedDataParallel(model, device_ids=[rank])
-
-    if shampoo:
-        optimizer = ZeroShampooWithAdamGraftingOptimizer(
-            model.parameters(), lr=lr / width, start_preconditioning=20
-        )
-    else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr / width)
-
-    # Training and evaluation loop
-    best_accuracy = 0
-    for epoch in range(1, epochs + 1):
-        train_sampler.set_epoch(epoch)
-        t0 = time.time()
-
-        if dist.get_rank() == 0 and do_profile:
-            prof = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                record_shapes=True,
-            )
-            prof.__enter__()
-
-        train(model, device, train_loader, optimizer, epoch)
-
-        if dist.get_rank() == 0 and do_profile:
-            prof.__exit__(None, None, None)
-
-            print("saving profile to", Path("./checkpoint") / "trace.json")
-            prof.export_chrome_trace(str(Path("./checkpoint") / "trace.json"))
-
-        T = time.time() - t0
-        if dist.get_rank() == 0:
-            print(f"Epoch {epoch} took {T:.2f} seconds")
-            print(f"MFU: {100 * flop_for_fwd_bwd / T / theoretical_flops:.2f}%")
-            # 6 * 187805706 * 10 * 8 * 64 * 512 / 1.61 / (8 * 500 * 10^12) # 0.45
-            # 6 * N * (10 * 8 * 64 * 512) / (1.61 * 8 * 980 * 10^12)
-            print(f"TFLOPS: {theoretical_flops / 10**12}")
-            print(f"TFlop required for one epoch: {flop_for_fwd_bwd / 10**12}")
-            print(f"num_params: {num_params}")
-
-        accuracy, test_loss = test(model, device, test_loader)
-
-    if rank == 0:
-        print(f"Best test accuracy: {best_accuracy:.2f}%")
-        wandb.finish()
-
-
-if __name__ == "__main__":
-    main()
