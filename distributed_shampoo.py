@@ -1,22 +1,3 @@
-import math
-
-import numpy as np
-import torch
-import torch.distributed as dist
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
-
-import math
-import numpy as np
-import torch
-import torch.distributed as dist
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
-import math
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -136,19 +117,34 @@ class ZeroShampooWithAdamGraftingOptimizer:
         ), f"Total params: {total_params} != {total_param_in_model}"
 
     def _enumerate_sharded_params(self):
-        for global_counter, block_name, param, (s1, s2), (i1, i1r), (
-            i2,
-            i2r,
-        ), group in self.enumeratables:
+        for (
+            global_counter,
+            block_name,
+            param,
+            (s1, s2),
+            (i1, i1r),
+            (
+                i2,
+                i2r,
+            ),
+            group,
+        ) in self.enumeratables:
             if global_counter % self.world_size != self.rank:
                 continue
             yield block_name, param, (s1, s2), (i1, i1r), (i2, i2r), group
 
     def _init_state(self):
-        for block_name, param, (s1, s2), (i1, i1r), (
-            i2,
-            i2r,
-        ), group in self._enumerate_sharded_params():
+        for (
+            block_name,
+            param,
+            (s1, s2),
+            (i1, i1r),
+            (
+                i2,
+                i2r,
+            ),
+            group,
+        ) in self._enumerate_sharded_params():
             block_param = param.view(s1, s2)[i1:i1r, i2:i2r]
             print(
                 f"Rank {self.rank} is managing parameter {block_name}, shape: {block_param.shape}, dtype: {block_param.dtype}, range {i1}:{i1r}, {i2}:{i2r}"
@@ -191,10 +187,17 @@ class ZeroShampooWithAdamGraftingOptimizer:
     def step(self):
         self._reduce_gradients()
 
-        for block_name, param, (s1, s2), (i1, i1r), (
-            i2,
-            i2r,
-        ), group in self._enumerate_sharded_params():
+        for (
+            block_name,
+            param,
+            (s1, s2),
+            (i1, i1r),
+            (
+                i2,
+                i2r,
+            ),
+            group,
+        ) in self._enumerate_sharded_params():
             grad = param.grad
             assert grad is not None, f"Gradient is None for {block_name}"
             state = self.state[block_name]
@@ -252,15 +255,15 @@ class ZeroShampooWithAdamGraftingOptimizer:
 
             if state["step"] >= start_preconditioning:
                 if state["step"] % precondition_frequency == 0:
-                    state[
-                        "left_preconditioner"
-                    ] = self._matrix_pth_power_via_eigendecompsition(
-                        state["left_preconditioner_accum"], p=-1 / 4
+                    state["left_preconditioner"] = (
+                        self._matrix_pth_power_via_eigendecompsition(
+                            state["left_preconditioner_accum"], p=-1 / 4
+                        )
                     )
-                    state[
-                        "right_preconditioner"
-                    ] = self._matrix_pth_power_via_eigendecompsition(
-                        state["right_preconditioner_accum"], p=-1 / 4
+                    state["right_preconditioner"] = (
+                        self._matrix_pth_power_via_eigendecompsition(
+                            state["right_preconditioner_accum"], p=-1 / 4
+                        )
                     )
 
                 fnorm_of_adam_update_dir = torch.linalg.norm(adam_update_dir)
@@ -297,10 +300,17 @@ class ZeroShampooWithAdamGraftingOptimizer:
                 num_total_params += param.numel()
 
         num_non_zero_params = 0
-        for block_name, param, (s1, s2), (i1, i1r), (
-            i2,
-            i2r,
-        ), group in self._enumerate_sharded_params():
+        for (
+            block_name,
+            param,
+            (s1, s2),
+            (i1, i1r),
+            (
+                i2,
+                i2r,
+            ),
+            group,
+        ) in self._enumerate_sharded_params():
             state = self.state[block_name]
             # check if the values are very-close to non-zero or not
             assert not torch.allclose(
@@ -318,10 +328,18 @@ class ZeroShampooWithAdamGraftingOptimizer:
 
     def build_global_state_for_debug_purposes(self):
         self.global_state = {}
-        for global_counter, block_name, param, (s1, s2), (i1, i1r), (
-            i2,
-            i2r,
-        ), group in self.enumeratables:
+        for (
+            global_counter,
+            block_name,
+            param,
+            (s1, s2),
+            (i1, i1r),
+            (
+                i2,
+                i2r,
+            ),
+            group,
+        ) in self.enumeratables:
             if global_counter % self.world_size != self.rank:
                 continue
 
@@ -372,10 +390,18 @@ class ZeroShampooWithAdamGraftingOptimizer:
         if not self.is_distributed:
             return
         did_broadcast_list = set()
-        for global_counter, block_name, param, (s1, s2), (i1, i1r), (
-            i2,
-            i2r,
-        ), group in self.enumeratables:
+        for (
+            global_counter,
+            block_name,
+            param,
+            (s1, s2),
+            (i1, i1r),
+            (
+                i2,
+                i2r,
+            ),
+            group,
+        ) in self.enumeratables:
             if global_counter in did_broadcast_list:
                 continue
 
@@ -396,16 +422,10 @@ class ZeroShampooWithAdamGraftingOptimizer:
                     dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
 
 
-import os
-import time
-
-import click
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, DistributedSampler
-from torchvision import datasets, transforms
 
 import wandb
 
