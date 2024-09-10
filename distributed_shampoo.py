@@ -2,9 +2,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
 
 class ZeroShampooWithAdamGraftingOptimizer:
     def __init__(
@@ -123,10 +120,7 @@ class ZeroShampooWithAdamGraftingOptimizer:
             param,
             (s1, s2),
             (i1, i1r),
-            (
-                i2,
-                i2r,
-            ),
+            (i2, i2r),
             group,
         ) in self.enumeratables:
             if global_counter % self.world_size != self.rank:
@@ -139,10 +133,7 @@ class ZeroShampooWithAdamGraftingOptimizer:
             param,
             (s1, s2),
             (i1, i1r),
-            (
-                i2,
-                i2r,
-            ),
+            (i2, i2r),
             group,
         ) in self._enumerate_sharded_params():
             block_param = param.view(s1, s2)[i1:i1r, i2:i2r]
@@ -192,10 +183,7 @@ class ZeroShampooWithAdamGraftingOptimizer:
             param,
             (s1, s2),
             (i1, i1r),
-            (
-                i2,
-                i2r,
-            ),
+            (i2, i2r),
             group,
         ) in self._enumerate_sharded_params():
             grad = param.grad
@@ -204,7 +192,6 @@ class ZeroShampooWithAdamGraftingOptimizer:
 
             block_param = param.view(s1, s2)[i1:i1r, i2:i2r]
             block_grad = grad.view(s1, s2)[i1:i1r, i2:i2r]
-            # print(block_grad.shape, block_param.shape, block_name, i1, i1r, i2, i2r)
 
             assert block_param.shape == block_grad.shape, (
                 block_param.shape,
@@ -227,14 +214,12 @@ class ZeroShampooWithAdamGraftingOptimizer:
             start_preconditioning = group["start_preconditioning"]
             precondition_frequency = group["precondition_frequency"]
 
-            # print(f"Rank {self.rank} is using learning rate {lr}, step {state['step']}")
-
             # Perform stepweight decay
             if independent_weight_decay:
                 block_param.data.mul_(1 - lr * weight_decay)
 
             block_grad_shape = block_grad.shape
-            # print(block_grad)
+
             # Update preconditioners
             state["left_preconditioner_accum"].mul_(shampoo_beta1).add_(
                 block_grad @ block_grad.t(), alpha=1 - shampoo_beta1
@@ -255,15 +240,15 @@ class ZeroShampooWithAdamGraftingOptimizer:
 
             if state["step"] >= start_preconditioning:
                 if state["step"] % precondition_frequency == 0:
-                    state["left_preconditioner"] = (
-                        self._matrix_pth_power_via_eigendecompsition(
-                            state["left_preconditioner_accum"], p=-1 / 4
-                        )
+                    state[
+                        "left_preconditioner"
+                    ] = self._matrix_pth_power_via_eigendecompsition(
+                        state["left_preconditioner_accum"], p=-1 / 4
                     )
-                    state["right_preconditioner"] = (
-                        self._matrix_pth_power_via_eigendecompsition(
-                            state["right_preconditioner_accum"], p=-1 / 4
-                        )
+                    state[
+                        "right_preconditioner"
+                    ] = self._matrix_pth_power_via_eigendecompsition(
+                        state["right_preconditioner_accum"], p=-1 / 4
                     )
 
                 fnorm_of_adam_update_dir = torch.linalg.norm(adam_update_dir)
@@ -305,10 +290,7 @@ class ZeroShampooWithAdamGraftingOptimizer:
             param,
             (s1, s2),
             (i1, i1r),
-            (
-                i2,
-                i2r,
-            ),
+            (i2, i2r),
             group,
         ) in self._enumerate_sharded_params():
             state = self.state[block_name]
@@ -334,10 +316,7 @@ class ZeroShampooWithAdamGraftingOptimizer:
             param,
             (s1, s2),
             (i1, i1r),
-            (
-                i2,
-                i2r,
-            ),
+            (i2, i2r),
             group,
         ) in self.enumeratables:
             if global_counter % self.world_size != self.rank:
@@ -420,101 +399,3 @@ class ZeroShampooWithAdamGraftingOptimizer:
             for param in group["params"]:
                 if param.grad is not None:
                     dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
-
-
-import torch
-import torch.distributed as dist
-import torch.nn as nn
-import torch.nn.functional as F
-
-import wandb
-
-TOKEN_LENGTH = 1024
-
-
-class Net(nn.Module):
-    def __init__(self, width=32):
-        super(Net, self).__init__()
-
-        self.mlp = nn.Sequential(
-            nn.Linear(28 * 28, width),
-            nn.ReLU(),
-            nn.Linear(width, width, bias=False),
-            nn.ReLU(),
-            nn.Linear(width, width, bias=False),
-            nn.ReLU(),
-            nn.Linear(width, width, bias=False),
-            nn.ReLU(),
-            nn.Linear(width, width, bias=False),
-            nn.ReLU(),
-            nn.Linear(width, width, bias=False),
-            nn.ReLU(),
-            nn.Linear(width, width, bias=False),
-            nn.ReLU(),
-            nn.Linear(width, width, bias=False),
-            nn.ReLU(),
-            nn.Linear(width, width, bias=False),
-            nn.ReLU(),
-            nn.Linear(width, width, bias=False),
-            nn.ReLU(),
-            nn.Linear(width, width, bias=False),
-            nn.ReLU(),
-            nn.Linear(width, width, bias=False),
-            nn.ReLU(),
-            nn.Linear(width, 10),
-        )
-
-        # self.mlp[4].weight.data.fill_(0)
-
-    @torch.compile()
-    def forward(self, x):
-        x = x.view(-1, 1, 28 * 28)
-        x = x.repeat(1, TOKEN_LENGTH, 1)
-        x = self.mlp(x)
-        x = x.mean(dim=1)
-        return F.log_softmax(x, dim=1)
-
-
-def train(model, device, train_loader, optimizer, epoch):
-    model.train()
-    for batch_idx, (data, target) in enumerate(train_loader):
-        data, target = data.to(device), target.to(device)
-        optimizer.zero_grad()
-        output = model(data)
-        loss = F.nll_loss(output, target)
-        loss.backward()
-        optimizer.reduce_gradients()
-        optimizer.step()
-
-        if batch_idx % 100 == 0 and dist.get_rank() == 0:
-            print(
-                f"Train Epoch: {epoch} [{batch_idx * len(data) * dist.get_world_size()}/{len(train_loader.dataset)} "
-                f"({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}"
-            )
-            wandb.log({"train_loss": loss.item(), "epoch": epoch, "batch": batch_idx})
-
-    print(batch_idx)
-
-
-def test(model, device, test_loader):
-    model.eval()
-    test_loss = 0
-    correct = 0
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            test_loss += F.nll_loss(output, target, reduction="sum").item()
-            pred = output.argmax(dim=1, keepdim=True)
-            correct += pred.eq(target.view_as(pred)).sum().item()
-
-    test_loss /= len(test_loader.dataset)
-    accuracy = 100.0 * correct / len(test_loader.dataset)
-
-    if dist.get_rank() == 0:
-        print(
-            f"\nTest set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.2f}%)\n"
-        )
-        wandb.log({"test_loss": test_loss, "accuracy": accuracy})
-
-    return accuracy, test_loss
